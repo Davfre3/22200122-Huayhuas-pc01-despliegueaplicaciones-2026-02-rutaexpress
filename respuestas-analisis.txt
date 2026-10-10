@@ -1,0 +1,137 @@
+PRÁCTICA CALIFICADA 01 - DESPLIEGUE DE APLICACIONES
+PREGUNTAS DE ANÁLISIS - RUTAEXPRESS
+Alumno: David Huayhuas
+Código: 22200122
+Repositorio: 22200122-huayhuas-pc01-despliegue-aplicaciones-2026-02-rutaexpress
+Imagen Docker Hub: davfre34/envios-app:1.0.0
+
+NOTA PARA ANTES DE ENTREGAR: reemplaza todo lo que está entre [CORCHETES] con los datos reales
+de tus pruebas (ids, réplicas, conteos) y borra esta nota. Cada dato debe salir de tus
+capturas o de cliente-log.jsonl.
+
+======================================================================
+1. TIMEOUT Y RECUPERACIÓN
+======================================================================
+En mi prueba activé la demora de 5 segundos y el cliente esperó solo 2 segundos. El cliente
+registró TIMEOUT_CLIENTE (duración [DURACION_MS] ms) con la key KEY-TIMEOUT-001. Sin embargo,
+al consultar DBeaver antes de retirar la demora, el envío ya existía con id [ID_ENVIO] y su
+created_at era anterior al fin del timeout. En la tabla intentos quedó resultado = CREADO,
+http_status vacío y respuesta_entregada = false: el servidor terminó el trabajo, pero el
+cliente nunca vio la respuesta.
+
+Luego retiré la demora y reenvié la misma Idempotency-Key. Respondieron las réplicas
+[REPLICAS, por ejemplo app1, app3 y app2] con HTTP 200, la cabecera Idempotent-Replay: true y
+el mismo id [ID_ENVIO]. Al final solo había 1 fila para esa key.
+
+Lo que evita mi solución es que el reintento cree un segundo envío. Si el trabajador no recibe
+respuesta y vuelve a enviar, el sistema reconoce que es la misma operación y devuelve el envío
+original. Esto es importante para RutaExpress porque un envío duplicado significa dos recojos
+que consumen tiempo y vehículos, dos cobros al mismo cliente y una pérdida de confianza,
+además de un reclamo que hay que resolver a mano. El trabajador no tiene forma de saber si su
+primer intento llegó o no, así que reintentar es lo normal y el sistema debe soportarlo.
+
+======================================================================
+2. CONCURRENCIA Y RÉPLICAS
+======================================================================
+En mi prueba envié dos solicitudes simultáneas con la misma key ([KEY_CONCURRENTE]). Nginx las
+repartió a réplicas distintas ([REPLICA_1] y [REPLICA_2]). Una respondió 201 y la otra 200, con
+el mismo id [ID_ENVIO]. En la base de datos quedó una sola fila.
+
+Si ambas hubieran generado un envío, RutaExpress tendría dos registros de la misma operación:
+dos recojos y dos cobros para un único pedido. El problema no se arregla con "buscar si existe
+y luego insertar", porque con dos instancias trabajando al mismo tiempo las dos pueden buscar
+antes de que la otra inserte, no encontrar nada y crear las dos. Por eso el control se justifica
+aunque exista más de una instancia: más réplicas significan más probabilidad de que dos
+solicitudes iguales se procesen a la vez.
+
+Mi solución delega la decisión a PostgreSQL con una restricción UNIQUE sobre idempotency_key y
+un INSERT ... ON CONFLICT DO NOTHING. Como la base es compartida por las tres réplicas, solo una
+inserción puede ganar y la otra recibe el envío ya creado. Además, el control no depende de la
+memoria de ninguna réplica.
+
+Para los envíos nuevos intencionales con el mismo destinatario y dirección usé keys distintas
+([KEY_1] y [KEY_2]) y quedaron 2 envíos con ids [ID_1] y [ID_2]. Así distingo un reintento
+(misma key) de un envío nuevo (key distinta).
+
+======================================================================
+3. ENTREGA Y CONFIGURACIÓN
+======================================================================
+Otra oficina puede poner en funcionamiento la aplicación con tres comandos: clonar el repositorio,
+copiar .env.example a .env y ejecutar docker compose up -d. No necesita instalar Node.js ni
+PostgreSQL ni configurar nada a mano, porque la aplicación viaja en una imagen publicada en
+Docker Hub (davfre34/envios-app:1.0.0). Comprobé la descarga borrando la imagen local y
+haciendo docker pull, y la imagen corre con el usuario node y no con root.
+
+Esto reduce varios problemas de instalación y de diferencias entre equipos:
+- Versiones distintas de Node o de dependencias: la imagen fija node:20-alpine y las versiones
+  de package-lock.json con npm ci.
+- Configuración manual de la base de datos: init.sql crea las tablas automáticamente y el
+  compose levanta PostgreSQL con su volumen.
+- Contraseñas dentro del código: las credenciales no están en la imagen ni en el repositorio,
+  se pasan por variables de entorno desde un .env que está en .gitignore. Solo se entrega
+  .env.example con valores de ejemplo.
+- "En mi computadora funciona": el .dockerignore evita que entren archivos locales a la imagen
+  y todos los equipos ejecutan exactamente lo mismo.
+- Pasos olvidados: Nginx, las tres réplicas y la base quedan definidos en un solo archivo.
+
+======================================================================
+4. PERSISTENCIA Y RECUPERACIÓN
+======================================================================
+Registré [N] envíos (persist-001 a persist-00N) con ids [IDS] y los consulté en DBeaver.
+Luego ejecuté docker compose down y docker compose up -d sin la opción -v. Después de recrear
+los contenedores, los envíos seguían con los mismos ids y datos. Reintenté persist-001 y
+respondió 200 con el mismo id [ID], y no apareció ninguna fila nueva.
+
+Esto protege a RutaExpress de dos cosas. Primero, de perder envíos ya registrados: un reinicio
+o una actualización de contenedores no debe borrar pedidos que los clientes esperan que se
+recojan. Segundo, de duplicarlos: como las keys también se conservan en la base, un reintento
+posterior a la recreación sigue siendo reconocido como la misma operación.
+
+Si esa información se perdiera, la empresa tendría recojos pendientes sin registro, no podría
+atender reclamos ni demostrar qué se pidió, y un reintento de una operación ya completada se
+cobraría o recogería de nuevo, porque el sistema ya no sabría que existió. Por eso la base usa
+un volumen nombrado (pgdata) y nunca se debe usar docker compose down -v en producción.
+
+======================================================================
+5. CONTINUIDAD DEL SERVICIO
+======================================================================
+En mi prueba, antes de detener nada, las solicitudes a /health fueron atendidas por app1, app2 y
+app3. Después de ejecutar docker compose stop app2, el resumen mostró solo app1 y app3
+([CONTEO]), y registré [ERRORES_DE_TRANSICION o "ningún error"] durante la transición. Al
+iniciar app2 de nuevo, volvió a aparecer en las respuestas.
+
+Para una oficina que registra envíos durante su jornada, esto significa que la caída o el
+mantenimiento de una instancia no le impide trabajar: los trabajadores siguen registrando
+envíos sin enterarse de que una réplica está detenida. Se evita parar la operación y perder
+recojos por un fallo parcial.
+
+Aun así, tener tres réplicas no garantiza que el servicio nunca se interrumpa, porque las tres
+dependen de componentes únicos: hay una sola base de datos PostgreSQL y un solo Nginx. Si cae la
+base, las tres réplicas dejan de poder registrar envíos (el /health responde 503); si cae Nginx,
+nadie llega a las réplicas. Tampoco protege contra un error de código que afecte a las tres
+réplicas por igual, contra una caída de toda la máquina o contra un volumen dañado. Las
+réplicas dan tolerancia a fallos de la aplicación, pero no eliminan los demás puntos únicos de fallo.
+
+======================================================================
+6. RECHAZOS POR EXCESO DE SOLICITUDES
+======================================================================
+En la prueba de carga envié [TOTAL] solicitudes en ráfaga y duró [DURACION] ms. Se aceptaron
+[N_201] con 201 y se rechazaron [N_429] con 429, que coincide con el límite de 2 solicitudes por
+segundo más una ráfaga de 4 (cerca de 5 aceptadas). Después de esperar unos segundos, una nueva
+solicitud se aceptó con 201.
+
+Este control se justifica porque protege la disponibilidad. Sin límite, un cliente con un error
+(por ejemplo, un script que reintenta sin pausa) o una ráfaga excesiva podría saturar la
+aplicación y la base y dejar sin servicio a las demás oficinas. Limitar a una IP hace que el
+exceso se rechace en Nginx, antes de llegar a las réplicas y a la base, y que el resto de los
+usuarios siga siendo atendido normalmente.
+
+Los registros ayudan a atender el reclamo de un trabajador cuya solicitud fue rechazada. En
+rechazos-429.json cada rechazo guarda la hora, la IP del cliente, el método, la ruta y el
+código 429. Con eso puedo comprobar si el reclamo es cierto (por ejemplo, [EJEMPLO: la IP
+127.0.0.1 recibió 429 en POST /envios a las HH:MM:SS]), explicar que fue por exceso de
+solicitudes y no por un error del servicio, y confirmar que ese envío no se creó. Esos
+rechazos ocurren antes de llegar a la aplicación, por eso no aparecen en la tabla intentos y
+había que registrarlos en Nginx. Además, el log permanece al recrear el contenedor porque
+está en una carpeta montada en el equipo (el conteo antes y después fue [CONTEO]), y no guarda
+cuerpos ni cabeceras, así que no expone datos personales ni contraseñas.
