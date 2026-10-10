@@ -1,0 +1,12 @@
+# Activar:  docker compose -f docker-compose.yml -f docker-compose.delay.yml up -d
+# Retirar:  docker compose up -d
+services:
+  app1:
+    environment:
+      DELAY_MS: "5000"
+  app2:
+    environment:
+      DELAY_MS: "5000"
+  app3:
+    environment:
+      DELAY_MS: "5000"
