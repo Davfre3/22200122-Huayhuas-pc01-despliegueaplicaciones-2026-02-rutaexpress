@@ -28,13 +28,69 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// <<POST_ENVIOS>>
+app.post('/envios', async (req, res) => {
+  const { destinatario, direccion } = req.body || {};
+  const key = req.get('Idempotency-Key');
 
-app.use((err, req, res, next) => {
-  res.locals.resultado = 'RECHAZADO_VALIDACION';
-  res.status(err.status || 500).json({ error: 'Solicitud invalida' });
-});
+  if (
+    typeof destinatario !== 'string' || !destinatario.trim() ||
+    typeof direccion !== 'string' || !direccion.trim()
+  ) {
+    res.locals.resultado = 'RECHAZADO_VALIDACION';
+    return res.status(400).json({ error: 'destinatario y direccion son obligatorios y deben ser texto' });
+  }
+  if (!key || key.length > 128) {
+    res.locals.resultado = 'RECHAZADO_SIN_KEY';
+    return res.status(400).json({ error: 'Falta la cabecera Idempotency-Key' });
+  }
 
-app.listen(3000, '0.0.0.0', () => {
-  console.log(`[${INSTANCE_ID}] escuchando en el puerto 3000`);
+  const dest = destinatario.trim();
+  const dir = direccion.trim();
+  const hash = crypto.createHash('sha256').update(JSON.stringify([dest, dir])).digest('hex');
+
+  try {
+    const ins = await pool.query(
+      `INSERT INTO envios (destinatario, direccion, idempotency_key, request_hash)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING id, destinatario, direccion`,
+      [dest, dir, key, hash]
+    );
+
+    let envio;
+    let status;
+
+    if (ins.rowCount === 1) {
+      envio = ins.rows[0];
+      status = 201;
+      res.locals.resultado = 'CREADO';
+    } else {
+      const sel = await pool.query(
+        'SELECT id, destinatario, direccion, request_hash FROM envios WHERE idempotency_key = $1',
+        [key]
+      );
+      const previo = sel.rows[0];
+      if (previo.request_hash !== hash) {
+        res.locals.resultado = 'CONFLICTO_KEY';
+        res.locals.envioId = previo.id;
+        return res.status(422).json({ error: 'Esa Idempotency-Key ya se uso con otros datos' });
+      }
+      envio = previo;
+      status = 200;
+      res.locals.resultado = 'REPETIDO';
+      res.setHeader('Idempotent-Replay', 'true');
+    }
+
+    res.locals.envioId = envio.id;
+
+    return res.status(status).json({
+      id: Number(envio.id),
+      destinatario: envio.destinatario,
+      direccion: envio.direccion,
+    });
+  } catch (e) {
+    console.error(`[${INSTANCE_ID}] error en POST /envios:`, e.message);
+    res.locals.resultado = 'ERROR_SERVIDOR';
+    return res.status(500).json({ error: 'Error interno' });
+  }
 });
