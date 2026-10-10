@@ -107,6 +107,8 @@ app.post('/envios', async (req, res) => {
     }
 
     res.locals.envioId = envio.id;
+        
+    if (DELAY_MS > 0) await sleep(DELAY_MS);
 
     return res.status(status).json({
       id: Number(envio.id),
