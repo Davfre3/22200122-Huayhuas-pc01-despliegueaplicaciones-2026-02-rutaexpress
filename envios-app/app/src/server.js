@@ -16,17 +16,42 @@ app.use((req, res, next) => {
 
 // <<REGISTRO_INTENTOS>>
 
-app.use(express.json());
+app.use((req, res, next) => {
+  const inicio = new Date();
 
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', database: 'up', instance: INSTANCE_ID });
-  } catch (e) {
-    res.locals.resultado = 'ERROR_BD';
-    res.status(503).json({ status: 'error', database: 'down', instance: INSTANCE_ID });
-  }
+  res.on('close', async () => {
+    const entregada = res.writableFinished;
+    const resultado =
+      res.locals.resultado ||
+      (res.headersSent ? (res.statusCode >= 400 ? 'ERROR' : 'OK') : 'ABORTADO');
+    try {
+      await pool.query(
+        `INSERT INTO intentos
+           (ocurrido_en, metodo, ruta, instance_id, idempotency_key, resultado,
+            envio_id, http_status, ip_cliente, respuesta_entregada)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          inicio,
+          req.method,
+          req.originalUrl.split('?')[0],
+          INSTANCE_ID,
+          req.get('Idempotency-Key') || null,
+          resultado,
+          res.locals.envioId || null,
+          res.headersSent ? res.statusCode : null,
+          req.get('X-Real-IP') || req.socket.remoteAddress,
+          entregada,
+        ]
+      );
+    } catch (e) {
+      console.error(`[${INSTANCE_ID}] no se pudo registrar el intento:`, e.message);
+    }
+  });
+
+  next();
 });
+
+// <<POST_ENVIOS>>
 
 app.post('/envios', async (req, res) => {
   const { destinatario, direccion } = req.body || {};
